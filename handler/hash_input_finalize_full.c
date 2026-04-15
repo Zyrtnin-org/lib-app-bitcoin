@@ -207,32 +207,35 @@ int handle_output_state(unsigned int *processed) {
     } else {
       context.remainingOutputs--;
     }
-  } break;
 
-  default:
-    return -1;
-  }
-
-  /* Radiant-only: feed the just-completed output's bytes to the per-output
-   * FSM so they accumulate into hashOutputHashes alongside the existing
-   * hashedOutputs path. No-op for other coins. If the FSM rejects (e.g.,
-   * non-canonical-P2PKH script length), we surface SW_INCORRECT_DATA.
-   *
-   * We feed from either `discardSize` (normal displayable / non-displayable
-   * path) OR `context.discardSize` (deferred discard when UI approval is
-   * async). The bytes we want are context.currentOutput[0 ..
-   * bytes_to_feed-1]. */
-  if (COIN_KIND == COIN_KIND_RADIANT) {
-    unsigned int bytes_to_feed = (discardSize != 0) ? discardSize : context.discardSize;
-    if (bytes_to_feed > 0) {
+    /* Radiant-only: feed the just-completed output's bytes to the per-output
+     * FSM so they accumulate into hashOutputHashes alongside the existing
+     * hashedOutputs path. No-op for other coins. If the FSM rejects (e.g.,
+     * non-canonical-P2PKH script length), we surface SW_INCORRECT_DATA by
+     * returning -1 here — the caller turns that into a device error.
+     *
+     * CRITICAL: this is inside the OUTPUT case ONLY. Do NOT move this
+     * post-switch — the NUMBER_OUTPUTS case discards the vout-count
+     * varint (1 or 3 bytes) which MUST NOT be fed to the output FSM.
+     *
+     * We feed from either `discardSize` (normal non-displayable path)
+     * OR `context.discardSize` (deferred discard when displayable=true
+     * and UI approval is async). The bytes we want are
+     * context.currentOutput[0 .. bytes_to_feed-1]. */
+    if (COIN_KIND == COIN_KIND_RADIANT) {
+      unsigned int bytes_to_feed = (discardSize != 0) ? discardSize : context.discardSize;
       for (unsigned int i = 0; i < bytes_to_feed; i++) {
         unsigned short sw = radiant_output_hash_feed_byte(context.currentOutput[i]);
         if (sw != 0) {
-          PRINTF("Radiant FSM rejected byte %u: sw=0x%04x\n", i, sw);
+          PRINTF("Radiant FSM rejected output byte %u: sw=0x%04x\n", i, sw);
           return -1;
         }
       }
     }
+  } break;
+
+  default:
+    return -1;
   }
 
   if (discardSize != 0) {
