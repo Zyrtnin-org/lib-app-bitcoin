@@ -22,6 +22,7 @@
 #include "lib_standard_app/crypto_helpers.h"
 #include "read.h"
 
+#include "apdu/apdu_constants.h"
 #include "context.h"
 #include "helpers.h"
 
@@ -187,6 +188,171 @@ bool is_radiant_path_allowed(const unsigned char *bip32Path) {
     return false;
   }
   return true;
+}
+
+/* ==== Radiant hashOutputHashes streaming helpers ====
+ *
+ * The preimage Radiant expects includes an extra 32-byte hashOutputHashes
+ * field between nSequence and hashOutputs. hashOutputHashes is sha256d of
+ * the concatenation of per-output 76-byte summaries:
+ *
+ *    nValue               uint64 LE   (8 bytes)
+ *    sha256d(scriptPubKey) bytes      (32 bytes)
+ *    totalRefs            uint32 LE   (4 bytes)  (=0 for v1 canonical P2PKH)
+ *    refsHash             bytes       (32 bytes) (=zeros for v1)
+ *
+ * Plan reference: docs/plans/2026-04-15-feat-hashoutputhashes-preimage-fix-plan.md
+ * Oracle reference: scripts/radiant_preimage_oracle.py (port of radiantjs sighash.js)
+ *
+ * The handlers hand us output bytes as they stream in. We feed one byte at
+ * a time through a small FSM (amount → script_len → script) and emit a
+ * summary into the hashOutputHashesCtx each time we complete an output.
+ */
+
+#define RADIANT_CANONICAL_P2PKH_LEN 25
+#define RADIANT_MAX_SCRIPT_PUBKEY 10000 /* Generous bound; canonical P2PKH is 25 */
+
+void radiant_output_hash_init(void) {
+  if (COIN_KIND != COIN_KIND_RADIANT) {
+    return;
+  }
+  cx_sha256_init_no_throw(&context.hashOutputHashesCtx);
+  cx_sha256_init_no_throw(&context.currentOutputScriptCtx);
+  context.currentOutputBytesRemaining = 0;
+  context.currentOutputSatoshis = 0;
+  context.outputParsingSubstate = RADIANT_OUT_AMOUNT;
+  /* The amount is accumulated in the low 8 bytes of currentOutputSatoshis;
+   * we use currentOutputBytesRemaining to count them down from 8 → 0. */
+  context.currentOutputBytesRemaining = 8; /* waiting for 8 bytes of nValue */
+}
+
+void radiant_output_hash_reset(void) {
+  if (COIN_KIND != COIN_KIND_RADIANT) {
+    return;
+  }
+  /* Security H2 / SpecFlow #4, #6: unconditional reset of all Radiant state
+   * including currentOutputScriptCtx (which is re-inited per-output in normal
+   * flow, but a cancel mid-script would leave it half-consumed otherwise). */
+  cx_sha256_init_no_throw(&context.hashOutputHashesCtx);
+  cx_sha256_init_no_throw(&context.currentOutputScriptCtx);
+  context.currentOutputBytesRemaining = 0;
+  context.currentOutputSatoshis = 0;
+  context.outputParsingSubstate = RADIANT_OUT_AMOUNT;
+}
+
+unsigned short radiant_output_hash_feed_byte(unsigned char b) {
+  if (COIN_KIND != COIN_KIND_RADIANT) {
+    return 0;
+  }
+
+  switch (context.outputParsingSubstate) {
+    case RADIANT_OUT_AMOUNT: {
+      /* Accumulate 8 little-endian bytes into currentOutputSatoshis */
+      uint8_t byte_index = 8 - (uint8_t)context.currentOutputBytesRemaining;
+      context.currentOutputSatoshis |= ((uint64_t)b) << (8 * byte_index);
+      context.currentOutputBytesRemaining--;
+      if (context.currentOutputBytesRemaining == 0) {
+        /* Amount complete. Next: script length varint. */
+        context.outputParsingSubstate = RADIANT_OUT_SCRIPT_LEN;
+        /* Reuse currentOutputBytesRemaining as "varint bytes seen so far"
+         * in the SCRIPT_LEN state (0 = first byte, which is the varint prefix). */
+        context.currentOutputBytesRemaining = 0;
+      }
+      return 0;
+    }
+
+    case RADIANT_OUT_SCRIPT_LEN: {
+      /* Minimal varint decoder. For canonical P2PKH we expect 0x19 (25) as a
+       * single byte. Reject everything else outright: this is v1's "canonical
+       * P2PKH enforcement" from the plan (Security/Architecture review). */
+      if (context.currentOutputBytesRemaining == 0 && b == RADIANT_CANONICAL_P2PKH_LEN) {
+        /* Single-byte varint == 25. Transition to script streaming. */
+        cx_sha256_init_no_throw(&context.currentOutputScriptCtx);
+        context.currentOutputBytesRemaining = RADIANT_CANONICAL_P2PKH_LEN;
+        context.outputParsingSubstate = RADIANT_OUT_SCRIPT;
+        return 0;
+      }
+      /* Anything else — varint prefix, length != 25, etc. — reject.
+       * This enforces the v1 "canonical P2PKH only" rule at the device. */
+      PRINTF("Radiant: non-canonical-P2PKH output rejected (script_len byte 0x%02x)\n", b);
+      return SW_INCORRECT_DATA;
+    }
+
+    case RADIANT_OUT_SCRIPT: {
+      /* Stream the scriptPubKey bytes into the per-output inner sha256 */
+      if (cx_hash_no_throw(&context.currentOutputScriptCtx.header, 0, &b, 1, NULL, 0)) {
+        return SW_TECHNICAL_PROBLEM;
+      }
+      context.currentOutputBytesRemaining--;
+      if (context.currentOutputBytesRemaining == 0) {
+        /* Output complete. Finalize double-SHA256 of scriptPubKey, emit the
+         * 76-byte summary into hashOutputHashesCtx. */
+        uint8_t digest1[32];
+        if (cx_hash_no_throw(&context.currentOutputScriptCtx.header, CX_LAST,
+                             NULL, 0, digest1, 32)) {
+          return SW_TECHNICAL_PROBLEM;
+        }
+        cx_sha256_t finalCtx;
+        cx_sha256_init_no_throw(&finalCtx);
+        uint8_t scriptHash[32]; /* sha256d(scriptPubKey) */
+        if (cx_hash_no_throw(&finalCtx.header, CX_LAST, digest1, 32, scriptHash, 32)) {
+          return SW_TECHNICAL_PROBLEM;
+        }
+
+        /* Emit per-output summary: nValue(8 LE) | scriptHash(32) | totalRefs=0(4 LE) | refsHash=zeros(32) */
+        uint8_t summary[76];
+        for (int i = 0; i < 8; i++) {
+          summary[i] = (context.currentOutputSatoshis >> (8 * i)) & 0xff;
+        }
+        memmove(summary + 8, scriptHash, 32);
+        /* totalRefs = 0 (4 bytes LE) */
+        summary[40] = 0;
+        summary[41] = 0;
+        summary[42] = 0;
+        summary[43] = 0;
+        /* refsHash = 32 zero bytes */
+        memset(summary + 44, 0, 32);
+
+        if (cx_hash_no_throw(&context.hashOutputHashesCtx.header, 0,
+                             summary, sizeof(summary), NULL, 0)) {
+          return SW_TECHNICAL_PROBLEM;
+        }
+
+        /* Prepare for the next output */
+        context.outputParsingSubstate = RADIANT_OUT_AMOUNT;
+        context.currentOutputBytesRemaining = 8;
+        context.currentOutputSatoshis = 0;
+      }
+      return 0;
+    }
+
+    default:
+      /* Defensive: should never happen */
+      PRINTF("Radiant: invalid outputParsingSubstate %d\n", context.outputParsingSubstate);
+      return SW_TECHNICAL_PROBLEM;
+  }
+}
+
+unsigned short radiant_output_hash_finalize(void) {
+  /* Entry-point assertion (one, not per-write). If this fires, a future
+   * refactor accidentally routed a non-Radiant build through this path. */
+  if (COIN_KIND != COIN_KIND_RADIANT) {
+    return SW_TECHNICAL_PROBLEM;
+  }
+  /* Double-SHA256 of the accumulated per-output summaries. */
+  uint8_t digest1[32];
+  if (cx_hash_no_throw(&context.hashOutputHashesCtx.header, CX_LAST,
+                       NULL, 0, digest1, 32)) {
+    return SW_TECHNICAL_PROBLEM;
+  }
+  cx_sha256_t finalCtx;
+  cx_sha256_init_no_throw(&finalCtx);
+  if (cx_hash_no_throw(&finalCtx.header, CX_LAST, digest1, 32,
+                       context.segwit.cache.hashedOutputHashes, 32)) {
+    return SW_TECHNICAL_PROBLEM;
+  }
+  PRINTF("RADIANT hashedOutputHashes\n%.*H\n", 32, context.segwit.cache.hashedOutputHashes);
+  return 0;
 }
 
 int sign_finalhash(unsigned char *path, size_t path_len, unsigned char *in,

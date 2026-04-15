@@ -53,6 +53,49 @@ unsigned char enforce_bip44_coin_type(const unsigned char *bip32Path,
 // check is the actual line of defense.
 bool is_radiant_path_allowed(const unsigned char *bip32Path);
 
+/* Radiant-only output-streaming helpers. No-op for other COIN_KINDs.
+ *
+ * The device streams tx outputs in as multiple APDU chunks. For each output,
+ * we need to (a) pass bytes through the existing hashedOutputs stream, and
+ * (b) ALSO compute a per-output summary that feeds into hashOutputHashes.
+ *
+ * The summary is 76 bytes: nValue(8) + sha256d(scriptPubKey)(32) + totalRefs(4) + refsHash(32).
+ * For v1 (canonical P2PKH only) totalRefs=0 and refsHash=zeros, so we emit
+ * the summary directly without any push-ref scanning. v2 will extend this
+ * to call a GetPushRefs equivalent.
+ *
+ * These helpers are called from the output parsing loop in
+ * handler/hash_input_finalize_full.c, which hands them output bytes as they
+ * arrive. The byte stream format is <amount(8 LE)> <varint script_len> <script_bytes>.
+ */
+
+/* Initialize the running hashOutputHashes accumulator. Called once at the
+ * start of an output-hashing pass (currently invoked from hash_input_start.c
+ * when COIN_KIND == COIN_KIND_RADIANT). */
+void radiant_output_hash_init(void);
+
+/* Feed one byte of the output stream to the Radiant per-output FSM.
+ * Advances the FSM across nValue → script_len → script states, and when
+ * a full output has been seen emits its 76-byte summary into the running
+ * hashOutputHashes context.
+ *
+ * Returns 0 on success, non-zero SW code if the output is rejected
+ * (e.g., script_len != 25 during canonical P2PKH enforcement, or an
+ * oversized scriptPubKey). The caller must bail out with that SW on reject.
+ */
+unsigned short radiant_output_hash_feed_byte(unsigned char b);
+
+/* Finalize the running hashOutputHashes accumulator into
+ * context.segwit.cache.hashedOutputHashes. One entry-point assertion
+ * (`COIN_KIND == COIN_KIND_RADIANT`) guards this; not per-write. Returns 0
+ * on success, non-zero SW code otherwise. */
+unsigned short radiant_output_hash_finalize(void);
+
+/* Reset all Radiant per-output hashing state. Called from
+ * hash_input_finalize_full_reset to ensure clean slate between signs
+ * (Security H2: cancel/interrupt safety). No-op for other coins. */
+void radiant_output_hash_reset(void);
+
 void swap_bytes(unsigned char *target, unsigned char *source,
                 unsigned char size);
 

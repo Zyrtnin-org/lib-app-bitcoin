@@ -72,6 +72,16 @@ enum output_parsing_state_e {
 };
 typedef enum output_parsing_state_e output_parsing_state_t;
 
+/* Radiant-only per-output byte-streaming substates (see helpers.c).
+ * Tracks where in each output's bytes we are, since an output's
+ * scriptPubKey can span multiple APDU chunks. */
+enum radiant_output_substate_e {
+  RADIANT_OUT_AMOUNT = 0x00,    /* Accumulating the 8-byte nValue LE */
+  RADIANT_OUT_SCRIPT_LEN = 0x01,/* Accumulating the varint script length */
+  RADIANT_OUT_SCRIPT = 0x02,    /* Streaming scriptPubKey bytes into currentOutputScriptCtx */
+};
+typedef enum radiant_output_substate_e radiant_output_substate_t;
+
 typedef union multi_hash {
   cx_sha256_t sha256;
   cx_blake2b_t blake2b;
@@ -84,6 +94,11 @@ struct segwit_cache_s {
   unsigned char hashedPrevouts[32];
   unsigned char hashedSequence[32];
   unsigned char hashedOutputs[32];
+  /* Radiant-only: double-SHA256 of concatenated per-output summaries.
+   * Per-output summary = nValue(8) + sha256d(scriptPubKey)(32) + totalRefs(4) + refsHash(32).
+   * Inserted between hashedSequence and hashedOutputs in the preimage.
+   * Unused for other COIN_KINDs. */
+  unsigned char hashedOutputHashes[32];
 };
 
 /**
@@ -195,6 +210,16 @@ struct context_s {
   unsigned char outputParsingState;
   unsigned char totalOutputAmount[8];
   unsigned char changeOutputFound;
+
+  /* Radiant-only state for hashOutputHashes computation (see helpers.c).
+   * These fields are used only when COIN_KIND == COIN_KIND_RADIANT; other
+   * variants do not touch them. Initialized on hash_input_start and
+   * reset on hash_input_finalize_full_reset. */
+  cx_sha256_t hashOutputHashesCtx;      /* Running sha256 over per-output summaries */
+  cx_sha256_t currentOutputScriptCtx;   /* Per-output inner sha256 over scriptPubKey (first pass of sha256d) */
+  uint32_t currentOutputBytesRemaining; /* Bytes of the current output's scriptPubKey still to stream */
+  uint64_t currentOutputSatoshis;       /* nValue of the current output (latched when its 8 bytes arrive) */
+  unsigned char outputParsingSubstate;  /* Radiant per-output FSM: 0=amount, 1=script_len, 2=script */
 
   /* Overwinter */
   unsigned char usingOverwinter;

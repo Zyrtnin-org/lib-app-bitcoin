@@ -102,6 +102,10 @@ WEAK unsigned short handler_hash_input_start(buffer_t *buffer, uint8_t p1,
       }
       context.overwinterSignReady = 0;
       context.segwitParsedOnce = 0;
+
+      /* Radiant-only: initialize the hashOutputHashes accumulator + per-output
+       * FSM state. No-op for other coins. See helpers.c for details. */
+      radiant_output_hash_init();
       // Initialize for screen pairing
       memset(&context.tmpCtx.output, 0, sizeof(context.tmpCtx.output));
       context.tmpCtx.output.changeAccepted = 1;

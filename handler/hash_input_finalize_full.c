@@ -45,6 +45,10 @@ void hash_input_finalize_full_reset(void) {
   context.outputParsingState = OUTPUT_PARSING_NUMBER_OUTPUTS;
   memset(context.totalOutputAmount, 0, sizeof(context.totalOutputAmount));
   context.changeOutputFound = 0;
+  /* Security H2 / SpecFlow #4, #6: unconditionally reset Radiant per-output
+   * FSM state so a cancel mid-script leaves no stale bytes in the hasher
+   * contexts. Helper is a no-op for other coins. */
+  radiant_output_hash_reset();
 }
 
 static int check_output_displayable(bool *displayable) {
@@ -207,6 +211,28 @@ int handle_output_state(unsigned int *processed) {
 
   default:
     return -1;
+  }
+
+  /* Radiant-only: feed the just-completed output's bytes to the per-output
+   * FSM so they accumulate into hashOutputHashes alongside the existing
+   * hashedOutputs path. No-op for other coins. If the FSM rejects (e.g.,
+   * non-canonical-P2PKH script length), we surface SW_INCORRECT_DATA.
+   *
+   * We feed from either `discardSize` (normal displayable / non-displayable
+   * path) OR `context.discardSize` (deferred discard when UI approval is
+   * async). The bytes we want are context.currentOutput[0 ..
+   * bytes_to_feed-1]. */
+  if (COIN_KIND == COIN_KIND_RADIANT) {
+    unsigned int bytes_to_feed = (discardSize != 0) ? discardSize : context.discardSize;
+    if (bytes_to_feed > 0) {
+      for (unsigned int i = 0; i < bytes_to_feed; i++) {
+        unsigned short sw = radiant_output_hash_feed_byte(context.currentOutput[i]);
+        if (sw != 0) {
+          PRINTF("Radiant FSM rejected byte %u: sw=0x%04x\n", i, sw);
+          return -1;
+        }
+      }
+    }
   }
 
   if (discardSize != 0) {
@@ -423,6 +449,19 @@ hash_input_finalize_full_internal(transaction_summary_t *transactionSummary,
         }
       }
       PRINTF("hashOutputs\n%.*H\n", 32, context.segwit.cache.hashedOutputs);
+
+      /* Radiant-only: finalize hashOutputHashes alongside the existing
+       * hashedOutputs finalization. Produces context.segwit.cache.hashedOutputHashes
+       * which gets inserted into the preimage during the signing pass (transaction.c).
+       * Entry-point assertion inside the helper ensures we're in Radiant mode. */
+      if (COIN_KIND == COIN_KIND_RADIANT) {
+        unsigned short r_sw = radiant_output_hash_finalize();
+        if (r_sw != 0) {
+          sw = r_sw;
+          goto discardTransaction;
+        }
+      }
+
       if (cx_hash_no_throw(&context.transactionHashAuthorization.header,
                            CX_LAST, G_io_apdu_buffer, 0, authorizationHash,
                            32)) {

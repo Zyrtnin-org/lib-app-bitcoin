@@ -720,6 +720,28 @@ void transaction_parse(unsigned char parseMode) {
         }
         if (context.usingSegwit && context.segwitParsedOnce) {
           if (!context.usingOverwinter) {
+            /* Radiant-only: insert hashedOutputHashes BEFORE hashedOutputs.
+             * The preimage layout Radiant expects (per
+             * radiant-node/src/script/interpreter.cpp:2636-2650) is:
+             *
+             *   ... | nSequence | hashOutputHashes | hashOutputs | nLockTime | sighashType
+             *                     ^^^^^^^^^^^^^^^^
+             *                     new 32-byte field
+             *
+             * hashedOutputHashes was finalized in hash_input_finalize_full.c
+             * during the first-pass output stream. No-op for other coins. */
+            if (COIN_KIND == COIN_KIND_RADIANT) {
+              PRINTF("RADIANT hashedOutputHashes (preimage)\n%.*H\n",
+                     sizeof(context.segwit.cache.hashedOutputHashes),
+                     context.segwit.cache.hashedOutputHashes);
+              if (cx_hash_no_throw(&context.transactionHashFull.sha256.header, 0,
+                                   context.segwit.cache.hashedOutputHashes,
+                                   sizeof(context.segwit.cache.hashedOutputHashes),
+                                   NULL, 0)) {
+                goto fail;
+              }
+            }
+
             PRINTF("SEGWIT hashedOutputs\n%.*H\n",
                    sizeof(context.segwit.cache.hashedOutputs),
                    context.segwit.cache.hashedOutputs);
