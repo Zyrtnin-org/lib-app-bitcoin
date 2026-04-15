@@ -97,6 +97,12 @@ WEAK unsigned short handler_get_wallet_public_key(buffer_t *buffer, uint8_t p1,
     return io_send_sw(SW_INCORRECT_P1_P2);
   }
 
+  // Explicit Radiant arm: never allow CashAddr, even if upstream rules change.
+  // Defense against silent inheritance of future upstream behavior.
+  if (p2 == P2_CASHADDR && COIN_KIND == COIN_KIND_RADIANT) {
+    PRINTF("CashAddr not supported on Radiant\n");
+    return io_send_sw(SW_INCORRECT_P1_P2);
+  }
   if (p2 == P2_CASHADDR && COIN_KIND != COIN_KIND_BITCOIN_CASH) {
     PRINTF("Wrong P2 value\n");
     return io_send_sw(SW_INCORRECT_P1_P2);
@@ -111,6 +117,13 @@ WEAK unsigned short handler_get_wallet_public_key(buffer_t *buffer, uint8_t p1,
   if (buffer->size < 0x01) {
     PRINTF("Wrong size\n");
     return io_send_sw(SW_INCORRECT_LENGTH);
+  }
+
+  // Strict path-lock for Radiant: refuse derivations outside m/44'/512'/...
+  // Returns SW_INCORRECT_DATA — no user-prompt fallback.
+  if (!is_radiant_path_allowed(buffer->ptr)) {
+    PRINTF("Radiant path lock: refusing non-44'/512' derivation\n");
+    return io_send_sw(SW_INCORRECT_DATA);
   }
 
   if (display) {

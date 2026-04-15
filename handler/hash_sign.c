@@ -117,8 +117,12 @@ WEAK unsigned short handler_hash_sign(buffer_t *buffer, uint8_t p1,
   sighashType = *(parameters++);
   context.transactionSummary.sighashType = sighashType;
 
-  // if bitcoin cash OR forkid is set, then use the fork id
-  if ((COIN_KIND == COIN_KIND_BITCOIN_CASH) || (COIN_FORKID != 0)) {
+  // if bitcoin cash, RADIANT, or forkid is set, then use the fork id
+  // Radiant inherits BCH-style SIGHASH_ALL|FORKID=0x41 with fork value 0
+  // (radiant-node src/script/sighashtype.h:17 — SIGHASH_FORKID = 0x40)
+  if ((COIN_KIND == COIN_KIND_BITCOIN_CASH) ||
+      (COIN_KIND == COIN_KIND_RADIANT) ||
+      (COIN_FORKID != 0)) {
 #define SIGHASH_FORKID 0x40
     if (sighashType != (SIGHASH_ALL | SIGHASH_FORKID)) {
       context.transactionContext.transactionState = TRANSACTION_NONE;
@@ -131,6 +135,13 @@ WEAK unsigned short handler_hash_sign(buffer_t *buffer, uint8_t p1,
       context.transactionContext.transactionState = TRANSACTION_NONE;
       return io_send_sw(SW_INCORRECT_DATA);
     }
+  }
+
+  // Strict path-lock for Radiant: refuse to sign anything outside m/44'/512'/...
+  // No user-approval fallback for Radiant — outright reject.
+  if (!is_radiant_path_allowed(context.transactionSummary.keyPath)) {
+    context.transactionContext.transactionState = TRANSACTION_NONE;
+    return io_send_sw(SW_INCORRECT_DATA);
   }
 
   // Finalize the hash

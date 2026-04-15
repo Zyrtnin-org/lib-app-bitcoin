@@ -166,6 +166,29 @@ unsigned char enforce_bip44_coin_type(const unsigned char *bip32Path,
   return 0;
 }
 
+// Strict path-lock for COIN_KIND_RADIANT (no-op for other coins).
+// Returns true if the request can proceed; false if the caller must reject.
+bool is_radiant_path_allowed(const unsigned char *bip32Path) {
+  if (COIN_KIND != COIN_KIND_RADIANT) {
+    return true;
+  }
+  bip32_path_t p;
+  if (bip32Path[0] < 2) {
+    return false;
+  }
+  if (!parse_serialized_path(&p, bip32Path, MAX_BIP32_PATH_LENGTH)) {
+    return false;
+  }
+  // Require m/44'/512'/...
+  if ((p.path[BIP44_PURPOSE_OFFSET] ^ 0x80000000) != 44) {
+    return false;
+  }
+  if ((p.path[BIP44_COIN_TYPE_OFFSET] ^ 0x80000000) != 512) {
+    return false;
+  }
+  return true;
+}
+
 int sign_finalhash(unsigned char *path, size_t path_len, unsigned char *in,
                    unsigned short inlen, unsigned char *out, size_t *outlen) {
 

@@ -45,6 +45,14 @@ unsigned char bip44_derivation_guard(const unsigned char *bip32Path,
 unsigned char enforce_bip44_coin_type(const unsigned char *bip32Path,
                                       bool for_pubkey);
 
+// Strict path-lock for COIN_KIND_RADIANT only (no-op for other coins).
+// Returns true if the path is acceptable for Radiant (under m/44'/512'/...),
+// false if it must be rejected outright with SW_INCORRECT_DATA.
+// Defense-in-depth: LSB-014 install-time enforcement was empirically not active
+// on current Nano S Plus firmware (Phase 0 Task 0.0, 2026-04-15) — this runtime
+// check is the actual line of defense.
+bool is_radiant_path_allowed(const unsigned char *bip32Path);
+
 void swap_bytes(unsigned char *target, unsigned char *source,
                 unsigned char size);
 
