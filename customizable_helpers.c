@@ -85,6 +85,16 @@ WEAK unsigned char output_script_is_regular(unsigned char *buffer) {
               sizeof(TRANSACTION_OUTPUT_SCRIPT_POST)) == 0)) {
     return 1;
   }
+  /* Radiant: accept P2PKH-prefixed scripts of any length (Glyph outputs embed
+   * push-ref opcodes after the P2PKH pattern). Check OP_DUP OP_HASH160 PUSH20
+   * at buffer[1..3] and OP_EQUALVERIFY OP_CHECKSIG at buffer[24..25], ignoring
+   * the script_len varint at buffer[0]. */
+  if (COIN_KIND == COIN_KIND_RADIANT) {
+    if (buffer[1] == 0x76 && buffer[2] == 0xA9 && buffer[3] == 0x14 &&
+        buffer[24] == 0x88 && buffer[25] == 0xAC) {
+      return 1;
+    }
+  }
   if (COIN_KIND == COIN_KIND_HORIZEN) {
     if ((memcmp(buffer, ZEN_OUTPUT_SCRIPT_PRE, sizeof(ZEN_OUTPUT_SCRIPT_PRE)) ==
          0) &&
