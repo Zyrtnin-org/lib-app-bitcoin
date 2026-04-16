@@ -88,9 +88,16 @@ WEAK unsigned char output_script_is_regular(unsigned char *buffer) {
   /* Radiant: accept P2PKH-prefixed scripts of any length (Glyph outputs embed
    * push-ref opcodes after the P2PKH pattern). Check OP_DUP OP_HASH160 PUSH20
    * at buffer[1..3] and OP_EQUALVERIFY OP_CHECKSIG at buffer[24..25], ignoring
-   * the script_len varint at buffer[0]. */
+   * the script_len varint at buffer[0].
+   *
+   * Security: require the declared script length varint (buffer[0]) to be
+   * >= 0x19 (25 bytes) so the memcmps at buffer[24..25] read script bytes,
+   * not stale buffer data. Without this, a short malformed script could
+   * mis-classify by matching random bytes at those offsets, enabling a
+   * WYSIWYS display-spoofing attack (security audit 2026-04-16). */
   if (COIN_KIND == COIN_KIND_RADIANT) {
-    if (buffer[1] == 0x76 && buffer[2] == 0xA9 && buffer[3] == 0x14 &&
+    if (buffer[0] >= 0x19 &&
+        buffer[1] == 0x76 && buffer[2] == 0xA9 && buffer[3] == 0x14 &&
         buffer[24] == 0x88 && buffer[25] == 0xAC) {
       return 1;
     }
