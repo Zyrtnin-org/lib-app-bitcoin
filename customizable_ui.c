@@ -70,7 +70,13 @@ WEAK void get_address_from_output_script(unsigned char *script, int script_size,
   unsigned short version = COIN_P2SH_VERSION;
 
   if (output_script_is_regular(script)) {
-    addressOffset = 4;
+    /* Most shapes have the P2PKH hash at byte 4 (after script_len + OP_DUP
+     * + OP_HASH160 + PUSH20). Radiant's Glyph-wrapped P2PKH layout pushes
+     * the hash to byte 42 (past d8/d0 + 36-byte ref + OP_DROP + 3 P2PKH
+     * opcodes). Let the helper disambiguate — it returns 0 on unknown
+     * shapes, in which case we keep the legacy default of 4. */
+    unsigned char computed = output_script_p2pkh_offset(script);
+    addressOffset = (computed != 0) ? computed : 4;
     version = COIN_P2PKH_VERSION;
   }
 

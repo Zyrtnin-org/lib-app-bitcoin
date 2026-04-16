@@ -26,3 +26,14 @@ unsigned char output_script_is_op_return(unsigned char *buffer);
 unsigned char output_script_is_native_witness(unsigned char *buffer);
 unsigned char output_script_is_op_create(unsigned char *buffer, size_t size);
 unsigned char output_script_is_op_call(unsigned char *buffer, size_t size);
+
+/*
+ * Returns the byte offset (within `buffer`, where buffer[0] is the
+ * script-length varint) of the 20-byte P2PKH hash inside a recognised
+ * P2PKH-shaped output script. Supports:
+ *   - plain 25-byte P2PKH (offset 4)
+ *   - Radiant Glyph-wrapped P2PKH `d8|d0 <ref36> 75 <P2PKH>` (offset 42)
+ * Returns 0 for non-P2PKH shapes. Callers should treat 0 as "not a
+ * displayable P2PKH output".
+ */
+unsigned char output_script_p2pkh_offset(unsigned char *buffer);

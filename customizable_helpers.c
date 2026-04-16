@@ -101,6 +101,19 @@ WEAK unsigned char output_script_is_regular(unsigned char *buffer) {
         buffer[24] == 0x88 && buffer[25] == 0xAC) {
       return 1;
     }
+    /* Radiant Glyph-wrapped P2PKH output (transfer-preserving NFT spend):
+     *   <script_len=0x3F> <d8|d0> <ref36> <75 OP_DROP> <76 A9 14 hash20 88 AC>
+     * 0xd8 = OP_PUSHINPUTREFSINGLETON (NFT); 0xd0 = OP_PUSHINPUTREF (FT).
+     * Pin the layout strictly (exact 63-byte script, exact opcode positions at
+     * the known offsets) so random bytes can't mis-classify as displayable —
+     * consistent with the input-side Glyph fix (INVESTIGATION.md bug 1). */
+    if (buffer[0] == 0x3F &&
+        (buffer[1] == 0xD8 || buffer[1] == 0xD0) &&
+        buffer[38] == 0x75 &&
+        buffer[39] == 0x76 && buffer[40] == 0xA9 && buffer[41] == 0x14 &&
+        buffer[62] == 0x88 && buffer[63] == 0xAC) {
+      return 1;
+    }
   }
   if (COIN_KIND == COIN_KIND_HORIZEN) {
     if ((memcmp(buffer, ZEN_OUTPUT_SCRIPT_PRE, sizeof(ZEN_OUTPUT_SCRIPT_PRE)) ==
@@ -111,6 +124,36 @@ WEAK unsigned char output_script_is_regular(unsigned char *buffer) {
     }
   }
 
+  return 0;
+}
+
+/*
+ * Function: output_script_p2pkh_offset
+ * -------------------------------------
+ * Returns the byte offset within `buffer` (where buffer[0] is the script-
+ * length varint) of the 20-byte P2PKH hash for recognised P2PKH-shaped
+ * output scripts. Supports:
+ *   - plain 25-byte P2PKH                                  → offset 4
+ *   - zen-prefixed P2PKH (script_len=0x3F, P2PKH at start) → offset 4
+ *   - Radiant Glyph-wrapped P2PKH (d8|d0 <ref36> 75 ...)  → offset 42
+ * Returns 0 when the buffer is not a P2PKH shape this helper recognises;
+ * callers should fall back to their usual "not displayable" handling.
+ */
+WEAK unsigned char output_script_p2pkh_offset(unsigned char *buffer) {
+  /* Plain P2PKH: OP_DUP OP_HASH160 PUSH20 at start → hash at offset 4. */
+  if (buffer[1] == 0x76 && buffer[2] == 0xA9 && buffer[3] == 0x14) {
+    return 4;
+  }
+  /* Radiant Glyph-wrapped P2PKH: inner P2PKH starts at buffer[39], so the
+   * 20-byte hash starts at buffer[42]. Pin the same strict layout used by
+   * output_script_is_regular() above. */
+  if (COIN_KIND == COIN_KIND_RADIANT && buffer[0] == 0x3F &&
+      (buffer[1] == 0xD8 || buffer[1] == 0xD0) &&
+      buffer[38] == 0x75 &&
+      buffer[39] == 0x76 && buffer[40] == 0xA9 && buffer[41] == 0x14 &&
+      buffer[62] == 0x88 && buffer[63] == 0xAC) {
+    return 42;
+  }
   return 0;
 }
 
