@@ -225,6 +225,24 @@ static void radiant_opcode_walker_init(void) {
   context.opPushdataLenExpected = 0;
   context.refBufOffset = 0;
   context.numPushRefs = 0;
+  context.numDisallowRefs = 0;
+}
+
+/* Insert a disallow-ref into the deduplicated accumulator.
+ * Mirrors radiant_push_ref_insert but for OP_DISALLOWPUSHINPUTREF. */
+static unsigned short radiant_disallow_ref_insert(const uint8_t ref[RADIANT_REF_LEN]) {
+  for (uint8_t i = 0; i < context.numDisallowRefs; i++) {
+    if (memcmp(context.disallowRefs[i], ref, RADIANT_REF_LEN) == 0) {
+      return 0; /* already present */
+    }
+  }
+  if (context.numDisallowRefs >= RADIANT_MAX_PUSH_REFS) {
+    PRINTF("Radiant: too many disallow-refs in single output (max %d)\n", RADIANT_MAX_PUSH_REFS);
+    return SW_INCORRECT_DATA;
+  }
+  memmove(context.disallowRefs[context.numDisallowRefs], ref, RADIANT_REF_LEN);
+  context.numDisallowRefs++;
+  return 0;
 }
 
 /* Insert a push-ref into the sorted, deduplicated accumulator.
@@ -295,26 +313,47 @@ static unsigned short radiant_compute_refs_hash(uint8_t *out) {
 static unsigned short radiant_opcode_feed_byte(unsigned char b) {
   switch (context.opcodeSubstate) {
     case RADIANT_OP_NEXT: {
-      /* Reading the next opcode. */
+      /* Reading the next opcode.
+       *
+       * Bounds policy: currentOutputBytesRemaining includes the current byte
+       * at entry (decrement happens after this function returns). For any
+       * opcode that consumes K following bytes, we require
+       *   currentOutputBytesRemaining > K
+       * (strict) so that after the outer decrement, K more bytes are still
+       * available. Prevents PUSHDATA* integer-wrap and truncated-ref cases
+       * flagged by the 2026-04-16 security audit. */
       if (b > 0 && b < OP_PUSHDATA1) {
         /* Direct push: skip next `b` bytes */
+        if ((uint32_t)b >= context.currentOutputBytesRemaining) {
+          PRINTF("Radiant: direct-push length %u overshoots script end\n", b);
+          return SW_INCORRECT_DATA;
+        }
         context.opSkipRemaining = b;
         context.opcodeSubstate = RADIANT_OP_SKIP_DATA;
       } else if (b == OP_PUSHDATA1) {
+        if (context.currentOutputBytesRemaining <= 1) return SW_INCORRECT_DATA;
         context.opPushdataLenExpected = 1;
         context.opPushdataLenOffset = 0;
         context.opcodeSubstate = RADIANT_OP_PUSHDATA_LEN;
       } else if (b == OP_PUSHDATA2) {
+        if (context.currentOutputBytesRemaining <= 2) return SW_INCORRECT_DATA;
         context.opPushdataLenExpected = 2;
         context.opPushdataLenOffset = 0;
         context.opcodeSubstate = RADIANT_OP_PUSHDATA_LEN;
       } else if (b == OP_PUSHDATA4) {
+        if (context.currentOutputBytesRemaining <= 4) return SW_INCORRECT_DATA;
         context.opPushdataLenExpected = 4;
         context.opPushdataLenOffset = 0;
         context.opcodeSubstate = RADIANT_OP_PUSHDATA_LEN;
       } else if (b == OP_PUSHINPUTREF || b == OP_REQUIREINPUTREF ||
                  b == OP_DISALLOWPUSHINPUTREF || b == OP_DISALLOWPUSHINPUTREFSIBLING ||
                  b == OP_PUSHINPUTREFSINGLETON) {
+        /* Need exactly RADIANT_REF_LEN (36) more bytes after this opcode. */
+        if (context.currentOutputBytesRemaining <= RADIANT_REF_LEN) {
+          PRINTF("Radiant: push-ref opcode 0x%02x but only %u bytes remain\n",
+                 b, (unsigned)context.currentOutputBytesRemaining);
+          return SW_INCORRECT_DATA;
+        }
         context.opCurrentRefOpcode = b;
         context.refBufOffset = 0;
         context.opcodeSubstate = RADIANT_OP_READ_REF;
@@ -338,6 +377,14 @@ static unsigned short radiant_opcode_feed_byte(unsigned char b) {
         for (uint8_t i = 0; i < context.opPushdataLenExpected; i++) {
           len |= ((uint32_t)context.opPushdataLenBuf[i]) << (8 * i);
         }
+        /* Bound: after the outer decrement for this final length byte,
+         * len bytes must still be available. Prevents PUSHDATA4 integer-wrap
+         * where len claims 4GB but few bytes remain. */
+        if (len >= context.currentOutputBytesRemaining) {
+          PRINTF("Radiant: PUSHDATA length %u overshoots %u remaining\n",
+                 (unsigned)len, (unsigned)context.currentOutputBytesRemaining);
+          return SW_INCORRECT_DATA;
+        }
         if (len > 0) {
           context.opSkipRemaining = len;
           context.opcodeSubstate = RADIANT_OP_SKIP_DATA;
@@ -351,11 +398,16 @@ static unsigned short radiant_opcode_feed_byte(unsigned char b) {
     case RADIANT_OP_READ_REF: {
       context.refBuf[context.refBufOffset++] = b;
       if (context.refBufOffset >= RADIANT_REF_LEN) {
-        /* Full ref read. Only OP_PUSHINPUTREF and OP_PUSHINPUTREFSINGLETON
-         * contribute to totalRefs / refsHash. */
+        /* Full ref read. Route by opcode:
+         *   PUSHINPUTREF / PUSHINPUTREFSINGLETON → pushRefs (contributes to refsHash)
+         *   DISALLOWPUSHINPUTREF                  → disallowRefs (conflict check at emit)
+         *   REQUIREINPUTREF / DISALLOWPUSHINPUTREFSIBLING → no accumulator (ignored per radiantjs) */
         if (context.opCurrentRefOpcode == OP_PUSHINPUTREF ||
             context.opCurrentRefOpcode == OP_PUSHINPUTREFSINGLETON) {
           unsigned short sw = radiant_push_ref_insert(context.refBuf);
+          if (sw) return sw;
+        } else if (context.opCurrentRefOpcode == OP_DISALLOWPUSHINPUTREF) {
+          unsigned short sw = radiant_disallow_ref_insert(context.refBuf);
           if (sw) return sw;
         }
         context.opcodeSubstate = RADIANT_OP_NEXT;
@@ -492,6 +544,19 @@ unsigned short radiant_output_hash_feed_byte(unsigned char b) {
   }
 
 emit_summary: {
+    /* Consensus conflict check: radiantjs rejects any output where a ref
+     * appears in both push-ref and disallow-ref sets. Mainnet would reject
+     * the signed tx anyway, but catching it here keeps device-vs-oracle
+     * agreement and surfaces a clear error before signing. */
+    for (uint8_t i = 0; i < context.numDisallowRefs; i++) {
+      for (uint8_t j = 0; j < context.numPushRefs; j++) {
+        if (memcmp(context.disallowRefs[i], context.pushRefs[j], RADIANT_REF_LEN) == 0) {
+          PRINTF("Radiant: disallow-ref conflict with push-ref in same output\n");
+          return SW_INCORRECT_DATA;
+        }
+      }
+    }
+
     /* Output complete. Finalize sha256d(scriptPubKey). */
     uint8_t digest1[32];
     if (cx_hash_no_throw(&context.currentOutputScriptCtx.header, CX_LAST,

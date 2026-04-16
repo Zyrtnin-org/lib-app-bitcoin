@@ -264,6 +264,13 @@ struct context_s {
   uint8_t pushRefs[RADIANT_MAX_PUSH_REFS][RADIANT_REF_LEN];
   uint8_t numPushRefs;                  /* Count of unique push-refs found */
 
+  /* Disallow-ref accumulator (for consensus-matching conflict detection).
+   * radiantjs rejects any output where a ref appears in both PUSHINPUTREF
+   * and DISALLOWPUSHINPUTREF. We track disallows here and reject at
+   * emit_summary if any overlap with pushRefs. */
+  uint8_t disallowRefs[RADIANT_MAX_PUSH_REFS][RADIANT_REF_LEN];
+  uint8_t numDisallowRefs;              /* Count of unique disallow-refs */
+
   /* Overwinter */
   unsigned char usingOverwinter;
   unsigned char overwinterSignReady;
