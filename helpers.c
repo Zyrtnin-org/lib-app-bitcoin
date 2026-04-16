@@ -198,19 +198,175 @@ bool is_radiant_path_allowed(const unsigned char *bip32Path) {
  *
  *    nValue               uint64 LE   (8 bytes)
  *    sha256d(scriptPubKey) bytes      (32 bytes)
- *    totalRefs            uint32 LE   (4 bytes)  (=0 for v1 canonical P2PKH)
- *    refsHash             bytes       (32 bytes) (=zeros for v1)
+ *    totalRefs            uint32 LE   (4 bytes)
+ *    refsHash             bytes       (32 bytes)
+ *
+ * For Glyph outputs, the opcode walker scans scriptPubKey byte-by-byte to
+ * find OP_PUSHINPUTREF (0xD0) and OP_PUSHINPUTREFSINGLETON (0xD8). Each
+ * carries a 36-byte ref (32B txid + 4B vout). Unique refs are deduplicated,
+ * sorted lexicographically, concatenated, then sha256d'd → refsHash.
+ * totalRefs = count of unique push-refs. For plain P2PKH: totalRefs=0,
+ * refsHash=zeros (identical to the v1 result).
  *
  * Plan reference: docs/plans/2026-04-15-feat-hashoutputhashes-preimage-fix-plan.md
  * Oracle reference: scripts/radiant_preimage_oracle.py (port of radiantjs sighash.js)
- *
- * The handlers hand us output bytes as they stream in. We feed one byte at
- * a time through a small FSM (amount → script_len → script) and emit a
- * summary into the hashOutputHashesCtx each time we complete an output.
  */
 
-#define RADIANT_CANONICAL_P2PKH_LEN 25
-#define RADIANT_MAX_SCRIPT_PUBKEY 10000 /* Generous bound; canonical P2PKH is 25 */
+/* Maximum allowed script length. Glyph scripts can be large but we need a
+ * bound to protect against pathological cases. 10000 matches Bitcoin's
+ * MAX_SCRIPT_SIZE. */
+#define RADIANT_MAX_SCRIPT_PUBKEY 10000
+
+/* Reset opcode walker + push-ref accumulator for the next output. */
+static void radiant_opcode_walker_init(void) {
+  context.opcodeSubstate = RADIANT_OP_NEXT;
+  context.opSkipRemaining = 0;
+  context.opPushdataLenOffset = 0;
+  context.opPushdataLenExpected = 0;
+  context.refBufOffset = 0;
+  context.numPushRefs = 0;
+}
+
+/* Insert a push-ref into the sorted, deduplicated accumulator.
+ * Returns 0 on success, SW code if capacity exceeded. */
+static unsigned short radiant_push_ref_insert(const uint8_t ref[RADIANT_REF_LEN]) {
+  /* Check for duplicate (linear scan is fine for ≤8 entries). */
+  for (uint8_t i = 0; i < context.numPushRefs; i++) {
+    if (memcmp(context.pushRefs[i], ref, RADIANT_REF_LEN) == 0) {
+      return 0; /* already present */
+    }
+  }
+  if (context.numPushRefs >= RADIANT_MAX_PUSH_REFS) {
+    PRINTF("Radiant: too many push-refs in single output (max %d)\n", RADIANT_MAX_PUSH_REFS);
+    return SW_INCORRECT_DATA;
+  }
+  /* Insertion sort: find position, shift, insert. */
+  uint8_t pos = context.numPushRefs;
+  for (uint8_t i = 0; i < context.numPushRefs; i++) {
+    if (memcmp(ref, context.pushRefs[i], RADIANT_REF_LEN) < 0) {
+      pos = i;
+      break;
+    }
+  }
+  /* Shift entries [pos..numPushRefs-1] right by one. */
+  for (uint8_t i = context.numPushRefs; i > pos; i--) {
+    memmove(context.pushRefs[i], context.pushRefs[i - 1], RADIANT_REF_LEN);
+  }
+  memmove(context.pushRefs[pos], ref, RADIANT_REF_LEN);
+  context.numPushRefs++;
+  return 0;
+}
+
+/* Compute (totalRefs, refsHash) from the accumulated push-refs.
+ * Writes 4-byte totalRefs LE + 32-byte refsHash into out (must be ≥36 bytes). */
+static unsigned short radiant_compute_refs_hash(uint8_t *out) {
+  uint32_t n = context.numPushRefs;
+  out[0] = (uint8_t)(n & 0xff);
+  out[1] = (uint8_t)((n >> 8) & 0xff);
+  out[2] = (uint8_t)((n >> 16) & 0xff);
+  out[3] = (uint8_t)((n >> 24) & 0xff);
+
+  if (n == 0) {
+    memset(out + 4, 0, 32);
+    return 0;
+  }
+
+  /* sha256d(concat of all sorted unique refs) */
+  cx_sha256_t h;
+  cx_sha256_init_no_throw(&h);
+  for (uint8_t i = 0; i < n; i++) {
+    if (cx_hash_no_throw(&h.header, 0, context.pushRefs[i], RADIANT_REF_LEN, NULL, 0)) {
+      return SW_TECHNICAL_PROBLEM;
+    }
+  }
+  uint8_t digest1[32];
+  if (cx_hash_no_throw(&h.header, CX_LAST, NULL, 0, digest1, 32)) {
+    return SW_TECHNICAL_PROBLEM;
+  }
+  cx_sha256_init_no_throw(&h);
+  if (cx_hash_no_throw(&h.header, CX_LAST, digest1, 32, out + 4, 32)) {
+    return SW_TECHNICAL_PROBLEM;
+  }
+  return 0;
+}
+
+/* Feed one script byte through the opcode walker. Extracts push-refs.
+ * Returns 0 on success, non-zero SW on error. */
+static unsigned short radiant_opcode_feed_byte(unsigned char b) {
+  switch (context.opcodeSubstate) {
+    case RADIANT_OP_NEXT: {
+      /* Reading the next opcode. */
+      if (b > 0 && b < OP_PUSHDATA1) {
+        /* Direct push: skip next `b` bytes */
+        context.opSkipRemaining = b;
+        context.opcodeSubstate = RADIANT_OP_SKIP_DATA;
+      } else if (b == OP_PUSHDATA1) {
+        context.opPushdataLenExpected = 1;
+        context.opPushdataLenOffset = 0;
+        context.opcodeSubstate = RADIANT_OP_PUSHDATA_LEN;
+      } else if (b == OP_PUSHDATA2) {
+        context.opPushdataLenExpected = 2;
+        context.opPushdataLenOffset = 0;
+        context.opcodeSubstate = RADIANT_OP_PUSHDATA_LEN;
+      } else if (b == OP_PUSHDATA4) {
+        context.opPushdataLenExpected = 4;
+        context.opPushdataLenOffset = 0;
+        context.opcodeSubstate = RADIANT_OP_PUSHDATA_LEN;
+      } else if (b == OP_PUSHINPUTREF || b == OP_REQUIREINPUTREF ||
+                 b == OP_DISALLOWPUSHINPUTREF || b == OP_DISALLOWPUSHINPUTREFSIBLING ||
+                 b == OP_PUSHINPUTREFSINGLETON) {
+        context.opCurrentRefOpcode = b;
+        context.refBufOffset = 0;
+        context.opcodeSubstate = RADIANT_OP_READ_REF;
+      }
+      /* All other opcodes (OP_0, OP_1..OP_16, OP_DUP, etc.) are 1-byte, no payload. */
+      return 0;
+    }
+
+    case RADIANT_OP_SKIP_DATA: {
+      context.opSkipRemaining--;
+      if (context.opSkipRemaining == 0) {
+        context.opcodeSubstate = RADIANT_OP_NEXT;
+      }
+      return 0;
+    }
+
+    case RADIANT_OP_PUSHDATA_LEN: {
+      context.opPushdataLenBuf[context.opPushdataLenOffset++] = b;
+      if (context.opPushdataLenOffset >= context.opPushdataLenExpected) {
+        uint32_t len = 0;
+        for (uint8_t i = 0; i < context.opPushdataLenExpected; i++) {
+          len |= ((uint32_t)context.opPushdataLenBuf[i]) << (8 * i);
+        }
+        if (len > 0) {
+          context.opSkipRemaining = len;
+          context.opcodeSubstate = RADIANT_OP_SKIP_DATA;
+        } else {
+          context.opcodeSubstate = RADIANT_OP_NEXT;
+        }
+      }
+      return 0;
+    }
+
+    case RADIANT_OP_READ_REF: {
+      context.refBuf[context.refBufOffset++] = b;
+      if (context.refBufOffset >= RADIANT_REF_LEN) {
+        /* Full ref read. Only OP_PUSHINPUTREF and OP_PUSHINPUTREFSINGLETON
+         * contribute to totalRefs / refsHash. */
+        if (context.opCurrentRefOpcode == OP_PUSHINPUTREF ||
+            context.opCurrentRefOpcode == OP_PUSHINPUTREFSINGLETON) {
+          unsigned short sw = radiant_push_ref_insert(context.refBuf);
+          if (sw) return sw;
+        }
+        context.opcodeSubstate = RADIANT_OP_NEXT;
+      }
+      return 0;
+    }
+
+    default:
+      return SW_TECHNICAL_PROBLEM;
+  }
+}
 
 void radiant_output_hash_init(void) {
   if (COIN_KIND != COIN_KIND_RADIANT) {
@@ -218,26 +374,28 @@ void radiant_output_hash_init(void) {
   }
   cx_sha256_init_no_throw(&context.hashOutputHashesCtx);
   cx_sha256_init_no_throw(&context.currentOutputScriptCtx);
-  context.currentOutputBytesRemaining = 0;
-  context.currentOutputSatoshis = 0;
-  context.outputParsingSubstate = RADIANT_OUT_AMOUNT;
-  /* The amount is accumulated in the low 8 bytes of currentOutputSatoshis;
-   * we use currentOutputBytesRemaining to count them down from 8 → 0. */
   context.currentOutputBytesRemaining = 8; /* waiting for 8 bytes of nValue */
+  context.currentOutputSatoshis = 0;
+  context.currentOutputScriptLen = 0;
+  context.outputParsingSubstate = RADIANT_OUT_AMOUNT;
+  context.varintBufOffset = 0;
+  context.varintBufExpected = 0;
+  radiant_opcode_walker_init();
 }
 
 void radiant_output_hash_reset(void) {
   if (COIN_KIND != COIN_KIND_RADIANT) {
     return;
   }
-  /* Security H2 / SpecFlow #4, #6: unconditional reset of all Radiant state
-   * including currentOutputScriptCtx (which is re-inited per-output in normal
-   * flow, but a cancel mid-script would leave it half-consumed otherwise). */
   cx_sha256_init_no_throw(&context.hashOutputHashesCtx);
   cx_sha256_init_no_throw(&context.currentOutputScriptCtx);
   context.currentOutputBytesRemaining = 0;
   context.currentOutputSatoshis = 0;
+  context.currentOutputScriptLen = 0;
   context.outputParsingSubstate = RADIANT_OUT_AMOUNT;
+  context.varintBufOffset = 0;
+  context.varintBufExpected = 0;
+  radiant_opcode_walker_init();
 }
 
 unsigned short radiant_output_hash_feed_byte(unsigned char b) {
@@ -247,89 +405,127 @@ unsigned short radiant_output_hash_feed_byte(unsigned char b) {
 
   switch (context.outputParsingSubstate) {
     case RADIANT_OUT_AMOUNT: {
-      /* Accumulate 8 little-endian bytes into currentOutputSatoshis */
       uint8_t byte_index = 8 - (uint8_t)context.currentOutputBytesRemaining;
       context.currentOutputSatoshis |= ((uint64_t)b) << (8 * byte_index);
       context.currentOutputBytesRemaining--;
       if (context.currentOutputBytesRemaining == 0) {
-        /* Amount complete. Next: script length varint. */
         context.outputParsingSubstate = RADIANT_OUT_SCRIPT_LEN;
-        /* Reuse currentOutputBytesRemaining as "varint bytes seen so far"
-         * in the SCRIPT_LEN state (0 = first byte, which is the varint prefix). */
-        context.currentOutputBytesRemaining = 0;
+        context.varintBufOffset = 0;
+        context.varintBufExpected = 0;
       }
       return 0;
     }
 
     case RADIANT_OUT_SCRIPT_LEN: {
-      /* Minimal varint decoder. For canonical P2PKH we expect 0x19 (25) as a
-       * single byte. Reject everything else outright: this is v1's "canonical
-       * P2PKH enforcement" from the plan (Security/Architecture review). */
-      if (context.currentOutputBytesRemaining == 0 && b == RADIANT_CANONICAL_P2PKH_LEN) {
-        /* Single-byte varint == 25. Transition to script streaming. */
-        cx_sha256_init_no_throw(&context.currentOutputScriptCtx);
-        context.currentOutputBytesRemaining = RADIANT_CANONICAL_P2PKH_LEN;
-        context.outputParsingSubstate = RADIANT_OUT_SCRIPT;
-        return 0;
+      /* Bitcoin compact-size varint decoder.
+       * First byte: <0xFD → value is the byte itself
+       *             0xFD  → next 2 bytes (LE)
+       *             0xFE  → next 4 bytes (LE)
+       *             0xFF  → next 8 bytes (LE) — reject, scripts can't be that long */
+      if (context.varintBufExpected == 0) {
+        /* First byte of varint */
+        if (b < 0xFD) {
+          context.currentOutputScriptLen = b;
+        } else if (b == 0xFD) {
+          context.varintBufExpected = 2;
+          context.varintBufOffset = 0;
+          return 0;
+        } else if (b == 0xFE) {
+          context.varintBufExpected = 4;
+          context.varintBufOffset = 0;
+          return 0;
+        } else {
+          PRINTF("Radiant: 8-byte varint not supported for script length\n");
+          return SW_INCORRECT_DATA;
+        }
+      } else {
+        /* Multi-byte varint continuation */
+        context.varintBuf[context.varintBufOffset++] = b;
+        if (context.varintBufOffset < context.varintBufExpected) {
+          return 0;
+        }
+        /* Decode LE bytes */
+        context.currentOutputScriptLen = 0;
+        for (uint8_t i = 0; i < context.varintBufExpected; i++) {
+          context.currentOutputScriptLen |= ((uint32_t)context.varintBuf[i]) << (8 * i);
+        }
       }
-      /* Anything else — varint prefix, length != 25, etc. — reject.
-       * This enforces the v1 "canonical P2PKH only" rule at the device. */
-      PRINTF("Radiant: non-canonical-P2PKH output rejected (script_len byte 0x%02x)\n", b);
-      return SW_INCORRECT_DATA;
+
+      /* Script length now decoded. Sanity bound. */
+      if (context.currentOutputScriptLen > RADIANT_MAX_SCRIPT_PUBKEY) {
+        PRINTF("Radiant: script too long (%u)\n", (unsigned)context.currentOutputScriptLen);
+        return SW_INCORRECT_DATA;
+      }
+
+      /* OP_RETURN (script_len > 0, first byte 0x6a) and zero-length scripts
+       * are fine — the opcode walker just won't find any push-refs. */
+      cx_sha256_init_no_throw(&context.currentOutputScriptCtx);
+      context.currentOutputBytesRemaining = context.currentOutputScriptLen;
+      radiant_opcode_walker_init();
+      context.outputParsingSubstate = RADIANT_OUT_SCRIPT;
+
+      /* Handle zero-length scripts (degenerate edge case). */
+      if (context.currentOutputScriptLen == 0) {
+        goto emit_summary;
+      }
+      return 0;
     }
 
     case RADIANT_OUT_SCRIPT: {
-      /* Stream the scriptPubKey bytes into the per-output inner sha256 */
+      /* Feed byte into both the script hash and the opcode walker. */
       if (cx_hash_no_throw(&context.currentOutputScriptCtx.header, 0, &b, 1, NULL, 0)) {
         return SW_TECHNICAL_PROBLEM;
       }
+      unsigned short sw = radiant_opcode_feed_byte(b);
+      if (sw) return sw;
+
       context.currentOutputBytesRemaining--;
       if (context.currentOutputBytesRemaining == 0) {
-        /* Output complete. Finalize double-SHA256 of scriptPubKey, emit the
-         * 76-byte summary into hashOutputHashesCtx. */
-        uint8_t digest1[32];
-        if (cx_hash_no_throw(&context.currentOutputScriptCtx.header, CX_LAST,
-                             NULL, 0, digest1, 32)) {
-          return SW_TECHNICAL_PROBLEM;
-        }
-        cx_sha256_t finalCtx;
-        cx_sha256_init_no_throw(&finalCtx);
-        uint8_t scriptHash[32]; /* sha256d(scriptPubKey) */
-        if (cx_hash_no_throw(&finalCtx.header, CX_LAST, digest1, 32, scriptHash, 32)) {
-          return SW_TECHNICAL_PROBLEM;
-        }
-
-        /* Emit per-output summary: nValue(8 LE) | scriptHash(32) | totalRefs=0(4 LE) | refsHash=zeros(32) */
-        uint8_t summary[76];
-        for (int i = 0; i < 8; i++) {
-          summary[i] = (context.currentOutputSatoshis >> (8 * i)) & 0xff;
-        }
-        memmove(summary + 8, scriptHash, 32);
-        /* totalRefs = 0 (4 bytes LE) */
-        summary[40] = 0;
-        summary[41] = 0;
-        summary[42] = 0;
-        summary[43] = 0;
-        /* refsHash = 32 zero bytes */
-        memset(summary + 44, 0, 32);
-
-        if (cx_hash_no_throw(&context.hashOutputHashesCtx.header, 0,
-                             summary, sizeof(summary), NULL, 0)) {
-          return SW_TECHNICAL_PROBLEM;
-        }
-
-        /* Prepare for the next output */
-        context.outputParsingSubstate = RADIANT_OUT_AMOUNT;
-        context.currentOutputBytesRemaining = 8;
-        context.currentOutputSatoshis = 0;
+        goto emit_summary;
       }
       return 0;
     }
 
     default:
-      /* Defensive: should never happen */
       PRINTF("Radiant: invalid outputParsingSubstate %d\n", context.outputParsingSubstate);
       return SW_TECHNICAL_PROBLEM;
+  }
+
+emit_summary: {
+    /* Output complete. Finalize sha256d(scriptPubKey). */
+    uint8_t digest1[32];
+    if (cx_hash_no_throw(&context.currentOutputScriptCtx.header, CX_LAST,
+                         NULL, 0, digest1, 32)) {
+      return SW_TECHNICAL_PROBLEM;
+    }
+    cx_sha256_t finalCtx;
+    cx_sha256_init_no_throw(&finalCtx);
+    uint8_t scriptHash[32];
+    if (cx_hash_no_throw(&finalCtx.header, CX_LAST, digest1, 32, scriptHash, 32)) {
+      return SW_TECHNICAL_PROBLEM;
+    }
+
+    /* Build 76-byte per-output summary:
+     * nValue(8 LE) | sha256d(scriptPubKey)(32) | totalRefs(4 LE) | refsHash(32) */
+    uint8_t summary[76];
+    for (int i = 0; i < 8; i++) {
+      summary[i] = (context.currentOutputSatoshis >> (8 * i)) & 0xff;
+    }
+    memmove(summary + 8, scriptHash, 32);
+
+    unsigned short emit_sw = radiant_compute_refs_hash(summary + 40);
+    if (emit_sw) return emit_sw;
+
+    if (cx_hash_no_throw(&context.hashOutputHashesCtx.header, 0,
+                         summary, sizeof(summary), NULL, 0)) {
+      return SW_TECHNICAL_PROBLEM;
+    }
+
+    /* Prepare for the next output */
+    context.outputParsingSubstate = RADIANT_OUT_AMOUNT;
+    context.currentOutputBytesRemaining = 8;
+    context.currentOutputSatoshis = 0;
+    return 0;
   }
 }
 

@@ -60,9 +60,11 @@ bool is_radiant_path_allowed(const unsigned char *bip32Path);
  * (b) ALSO compute a per-output summary that feeds into hashOutputHashes.
  *
  * The summary is 76 bytes: nValue(8) + sha256d(scriptPubKey)(32) + totalRefs(4) + refsHash(32).
- * For v1 (canonical P2PKH only) totalRefs=0 and refsHash=zeros, so we emit
- * the summary directly without any push-ref scanning. v2 will extend this
- * to call a GetPushRefs equivalent.
+ *
+ * The opcode walker scans each script for Glyph push-ref opcodes (0xD0, 0xD8),
+ * extracts their 36-byte ref payloads, deduplicates and sorts them, then computes
+ * refsHash = sha256d(concat of sorted unique refs). For plain P2PKH (no refs),
+ * totalRefs=0 and refsHash=zeros — same result as the v1 implementation.
  *
  * These helpers are called from the output parsing loop in
  * handler/hash_input_finalize_full.c, which hands them output bytes as they
@@ -77,11 +79,12 @@ void radiant_output_hash_init(void);
 /* Feed one byte of the output stream to the Radiant per-output FSM.
  * Advances the FSM across nValue → script_len → script states, and when
  * a full output has been seen emits its 76-byte summary into the running
- * hashOutputHashes context.
+ * hashOutputHashes context. The script state runs an opcode walker that
+ * extracts Glyph push-refs for the refsHash computation.
  *
  * Returns 0 on success, non-zero SW code if the output is rejected
- * (e.g., script_len != 25 during canonical P2PKH enforcement, or an
- * oversized scriptPubKey). The caller must bail out with that SW on reject.
+ * (e.g., script exceeds MAX_SCRIPT_PUBKEY, too many push-refs, etc.).
+ * The caller must bail out with that SW on reject.
  */
 unsigned short radiant_output_hash_feed_byte(unsigned char b);
 
