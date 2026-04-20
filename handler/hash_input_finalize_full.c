@@ -162,7 +162,7 @@ int handle_output_state(unsigned int *processed) {
       *processed = 1;
       break;
     } else {
-      return -1;
+      return -11;  /* diag: NUMBER_OUTPUTS unsupported varint byte */
     }
   } break;
 
@@ -182,7 +182,7 @@ int handle_output_state(unsigned int *processed) {
       discardSize = 3;
     } else {
       // Unrealistically large script
-      return -1;
+      return -12;  /* diag: OUTPUT script_len is 0xFF varint */
     }
     if (context.currentOutputOffset < 8 + discardSize + scriptSize) {
       discardSize = 0;
@@ -195,7 +195,7 @@ int handle_output_state(unsigned int *processed) {
 
     bool displayable;
     if (check_output_displayable(&displayable)) {
-      return -1;
+      return -13;  /* diag: check_output_displayable rejected shape */
     }
 
     if (displayable) {
@@ -228,14 +228,14 @@ int handle_output_state(unsigned int *processed) {
         unsigned short sw = radiant_output_hash_feed_byte(context.currentOutput[i]);
         if (sw != 0) {
           PRINTF("Radiant FSM rejected output byte %u: sw=0x%04x\n", i, sw);
-          return -1;
+          return -14;  /* diag: radiant FSM feed_byte rejected */
         }
       }
     }
   } break;
 
   default:
-    return -1;
+    return -15;  /* diag: unknown outputParsingState */
   }
 
   if (discardSize != 0) {
@@ -382,8 +382,20 @@ hash_input_finalize_full_internal(transaction_summary_t *transactionSummary,
 
     unsigned int processed = 1;
     while (processed == 1) {
-      if (handle_output_state(&processed)) {
-        sw = SW_TECHNICAL_PROBLEM_2;
+      int _hos_ret = handle_output_state(&processed);
+      if (_hos_ret) {
+        /* Diagnostic SWs so the host can distinguish which branch
+         * inside handle_output_state rejected. 0x6FB1..0x6FB5 are in
+         * the reserved 0x6FXX technical-problem space and won't
+         * collide with standard Ledger SW codes. */
+        switch (_hos_ret) {
+          case -11: sw = 0x6FB1; break; /* NUMBER_OUTPUTS bad varint */
+          case -12: sw = 0x6FB2; break; /* OUTPUT script_len 0xFF varint */
+          case -13: sw = 0x6FB3; break; /* check_output_displayable rejected */
+          case -14: sw = 0x6FB4; break; /* radiant_output_hash_feed_byte */
+          case -15: sw = 0x6FB5; break; /* unknown parsing state */
+          default:  sw = SW_TECHNICAL_PROBLEM_2; break;
+        }
         goto discardTransaction;
       }
     }
