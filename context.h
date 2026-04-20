@@ -24,7 +24,11 @@
 #include "nbgl_types.h"
 #endif // HAVE_NBGL
 
-#define MAX_OUTPUT_TO_CHECK 100
+/* Must fit one complete output (8B value + 1B varint + up-to-75B Glyph FT
+ * holder script = 84B) PLUS one in-flight APDU chunk (~50B) while the
+ * previous output is pending UI approval. 100 was too small for 3+ FT-out
+ * transfers — bump to 200 to accommodate the chunk-overlap window. */
+#define MAX_OUTPUT_TO_CHECK 200
 #define MAX_COIN_ID 13
 #define MAX_SHORT_COIN_ID 5
 
