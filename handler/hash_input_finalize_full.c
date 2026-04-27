@@ -94,7 +94,7 @@ static int check_output_displayable(bool *displayable) {
       addressOffset = OUTPUT_SCRIPT_P2SH_PRE_LENGTH;
     } else {
       /* B3 (SECURITY_AUDIT_2026-04-20): Glyph-wrapped P2PKH outputs
-       * (d8|d0 <ref36> 75 76a914 <pkh20> 88ac) carry the pkh at
+       * (0xD8 <ref36> 75 76a914 <pkh20> 88ac) carry the pkh at
        * offset 42, not 4. Using the hardcoded
        * OUTPUT_SCRIPT_REGULAR_PRE_LENGTH=4 lets an attacker embed the
        * victim's change-address bytes inside the ref region at
@@ -102,17 +102,18 @@ static int check_output_displayable(bool *displayable) {
        * and be silently hidden from the on-device review while still
        * contributing to totalOutputAmount. Use the Glyph-aware
        * helper which returns 42 for the wrapper layout, 4 for plain
-       * P2PKH, 0 for unrecognised (→ no change match possible). */
+       * P2PKH, 0 for unrecognised.
+       *
+       * L1: when addressOffset == 0 (unrecognised script shape), skip the
+       * change-match memcmp entirely — fail closed. The previous fallback
+       * to OUTPUT_SCRIPT_REGULAR_PRE_LENGTH still ran the memcmp at a
+       * random offset, allowing a crafted unrecognised script to
+       * accidentally match the change address. */
       addressOffset = output_script_p2pkh_offset(context.currentOutput + 8);
-      if (addressOffset == 0) {
-        /* Unrecognised shape — don't let a memcmp at a random offset
-         * accidentally match; mark this output as not-change-candidate
-         * so it's displayed. */
-        addressOffset = OUTPUT_SCRIPT_REGULAR_PRE_LENGTH;
-      }
     }
-    if (!isP2sh && memcmp(context.currentOutput + 8 + addressOffset,
-                          context.tmpCtx.output.changeAddress, 20) == 0) {
+    if (!isP2sh && addressOffset != 0 &&
+        memcmp(context.currentOutput + 8 + addressOffset,
+               context.tmpCtx.output.changeAddress, 20) == 0) {
       changeFound = true;
     } else if (isP2sh && context.usingSegwit) {
       unsigned char changeSegwit[22];
