@@ -237,6 +237,11 @@ WEAK unsigned char output_script_is_native_witness(unsigned char *buffer) {
  *
  */
 WEAK unsigned char output_script_is_op_return(unsigned char *buffer) {
+  /* Reject zero-length scripts: buffer[0] == 0 means there are no script
+   * bytes, so reading buffer[1] would be out of bounds. */
+  if (buffer[0] == 0) {
+    return 0;
+  }
   if (COIN_KIND == COIN_KIND_BITCOIN_CASH) {
     return ((buffer[1] == 0x6A) ||
             ((buffer[1] == 0x00) && (buffer[2] == 0x6A)));
