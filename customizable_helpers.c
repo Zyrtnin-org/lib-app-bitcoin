@@ -142,6 +142,12 @@ WEAK unsigned char output_script_is_regular(unsigned char *buffer) {
  * callers should fall back to their usual "not displayable" handling.
  */
 WEAK unsigned char output_script_p2pkh_offset(unsigned char *buffer) {
+  /* Reject scripts too short to safely index buffer[24..25] — a script
+   * claiming P2PKH shape but with buffer[0] < 0x19 (< 25 bytes) would
+   * cause the caller to read 20 bytes of stale buffer data at offset 4. */
+  if (buffer[0] < 0x19) {
+    return 0;
+  }
   /* Plain P2PKH: OP_DUP OP_HASH160 PUSH20 at start → hash at offset 4. */
   if (buffer[1] == 0x76 && buffer[2] == 0xA9 && buffer[3] == 0x14) {
     return 4;
