@@ -1,0 +1,8 @@
+---
+# Radiant fork style: matches the existing 2-space K&R-ish layout used across
+# customizable_helpers.c, handler/*.c, and the Radiant-specific additions.
+# Upstream LedgerHQ/app-boilerplate uses Google + 4-space indent; the radiant-v1
+# branch diverged early and we codify that here rather than reflow ~16 commits.
+DisableFormat: true
+SortIncludes: false
+---

@@ -45,6 +45,60 @@ unsigned char bip44_derivation_guard(const unsigned char *bip32Path,
 unsigned char enforce_bip44_coin_type(const unsigned char *bip32Path,
                                       bool for_pubkey);
 
+// Strict path-lock for COIN_KIND_RADIANT only (no-op for other coins).
+// Returns true if the path is acceptable for Radiant (under m/44'/512'/...),
+// false if it must be rejected outright with SW_INCORRECT_DATA.
+// Defense-in-depth: LSB-014 install-time enforcement was empirically not active
+// on current Nano S Plus firmware (Phase 0 Task 0.0, 2026-04-15) — this runtime
+// check is the actual line of defense.
+bool is_radiant_path_allowed(const unsigned char *bip32Path);
+
+/* Radiant-only output-streaming helpers. No-op for other COIN_KINDs.
+ *
+ * The device streams tx outputs in as multiple APDU chunks. For each output,
+ * we need to (a) pass bytes through the existing hashedOutputs stream, and
+ * (b) ALSO compute a per-output summary that feeds into hashOutputHashes.
+ *
+ * The summary is 76 bytes: nValue(8) + sha256d(scriptPubKey)(32) + totalRefs(4) + refsHash(32).
+ *
+ * The opcode walker scans each script for Glyph push-ref opcodes (0xD0, 0xD8),
+ * extracts their 36-byte ref payloads, deduplicates and sorts them, then computes
+ * refsHash = sha256d(concat of sorted unique refs). For plain P2PKH (no refs),
+ * totalRefs=0 and refsHash=zeros — same result as the v1 implementation.
+ *
+ * These helpers are called from the output parsing loop in
+ * handler/hash_input_finalize_full.c, which hands them output bytes as they
+ * arrive. The byte stream format is <amount(8 LE)> <varint script_len> <script_bytes>.
+ */
+
+/* Initialize the running hashOutputHashes accumulator. Called once at the
+ * start of an output-hashing pass (currently invoked from hash_input_start.c
+ * when COIN_KIND == COIN_KIND_RADIANT). */
+void radiant_output_hash_init(void);
+
+/* Feed one byte of the output stream to the Radiant per-output FSM.
+ * Advances the FSM across nValue → script_len → script states, and when
+ * a full output has been seen emits its 76-byte summary into the running
+ * hashOutputHashes context. The script state runs an opcode walker that
+ * extracts Glyph push-refs for the refsHash computation.
+ *
+ * Returns 0 on success, non-zero SW code if the output is rejected
+ * (e.g., script exceeds MAX_SCRIPT_PUBKEY, too many push-refs, etc.).
+ * The caller must bail out with that SW on reject.
+ */
+unsigned short radiant_output_hash_feed_byte(unsigned char b);
+
+/* Finalize the running hashOutputHashes accumulator into
+ * context.segwit.cache.hashedOutputHashes. One entry-point assertion
+ * (`COIN_KIND == COIN_KIND_RADIANT`) guards this; not per-write. Returns 0
+ * on success, non-zero SW code otherwise. */
+unsigned short radiant_output_hash_finalize(void);
+
+/* Reset all Radiant per-output hashing state. Called from
+ * hash_input_finalize_full_reset to ensure clean slate between signs
+ * (Security H2: cancel/interrupt safety). No-op for other coins. */
+void radiant_output_hash_reset(void);
+
 void swap_bytes(unsigned char *target, unsigned char *source,
                 unsigned char size);
 

@@ -109,6 +109,15 @@ static unsigned short sign_message_internal(buffer_t *buffer, uint8_t p1,
         sw = SW_INCORRECT_DATA;
         goto discard;
       }
+      /* Radiant: defense-in-depth path-lock. Without this, a malicious host
+       * could invoke sign_message with m/44'/0'/... or similar, producing a
+       * signed "Radiant signed message" over chosen bytes using a key derived
+       * outside m/44'/512'/.... Match hash_sign.c + get_wallet_public_key.c. */
+      if (!is_radiant_path_allowed(buffer->ptr)) {
+        PRINTF("Radiant: sign_message rejected non-Radiant path\n");
+        sw = SW_INCORRECT_DATA;
+        goto discard;
+      }
       context.transactionSummary.payToAddressVersion = COIN_P2PKH_VERSION;
       context.transactionSummary.payToScriptHashVersion = COIN_P2SH_VERSION;
       memmove(context.transactionSummary.keyPath, buffer->ptr,

@@ -45,6 +45,10 @@ void hash_input_finalize_full_reset(void) {
   context.outputParsingState = OUTPUT_PARSING_NUMBER_OUTPUTS;
   memset(context.totalOutputAmount, 0, sizeof(context.totalOutputAmount));
   context.changeOutputFound = 0;
+  /* Security H2 / SpecFlow #4, #6: unconditionally reset Radiant per-output
+   * FSM state so a cancel mid-script leaves no stale bytes in the hasher
+   * contexts. Helper is a no-op for other coins. */
+  radiant_output_hash_reset();
 }
 
 static int check_output_displayable(bool *displayable) {
@@ -83,12 +87,33 @@ static int check_output_displayable(bool *displayable) {
 #endif
   if (context.tmpCtx.output.changeInitialized && !isOpReturn) {
     bool changeFound = false;
-    unsigned char addressOffset =
-        (isNativeSegwit ? OUTPUT_SCRIPT_NATIVE_WITNESS_PROGRAM_OFFSET
-         : isP2sh       ? OUTPUT_SCRIPT_P2SH_PRE_LENGTH
-                        : OUTPUT_SCRIPT_REGULAR_PRE_LENGTH);
-    if (!isP2sh && memcmp(context.currentOutput + 8 + addressOffset,
-                          context.tmpCtx.output.changeAddress, 20) == 0) {
+    unsigned char addressOffset;
+    if (isNativeSegwit) {
+      addressOffset = OUTPUT_SCRIPT_NATIVE_WITNESS_PROGRAM_OFFSET;
+    } else if (isP2sh) {
+      addressOffset = OUTPUT_SCRIPT_P2SH_PRE_LENGTH;
+    } else {
+      /* B3 (SECURITY_AUDIT_2026-04-20): Glyph-wrapped P2PKH outputs
+       * (0xD8 <ref36> 75 76a914 <pkh20> 88ac) carry the pkh at
+       * offset 42, not 4. Using the hardcoded
+       * OUTPUT_SCRIPT_REGULAR_PRE_LENGTH=4 lets an attacker embed the
+       * victim's change-address bytes inside the ref region at
+       * offset 12..31, causing a crafted output to match as "change"
+       * and be silently hidden from the on-device review while still
+       * contributing to totalOutputAmount. Use the Glyph-aware
+       * helper which returns 42 for the wrapper layout, 4 for plain
+       * P2PKH, 0 for unrecognised.
+       *
+       * L1: when addressOffset == 0 (unrecognised script shape), skip the
+       * change-match memcmp entirely — fail closed. The previous fallback
+       * to OUTPUT_SCRIPT_REGULAR_PRE_LENGTH still ran the memcmp at a
+       * random offset, allowing a crafted unrecognised script to
+       * accidentally match the change address. */
+      addressOffset = output_script_p2pkh_offset(context.currentOutput + 8);
+    }
+    if (!isP2sh && addressOffset != 0 &&
+        memcmp(context.currentOutput + 8 + addressOffset,
+               context.tmpCtx.output.changeAddress, 20) == 0) {
       changeFound = true;
     } else if (isP2sh && context.usingSegwit) {
       unsigned char changeSegwit[22];
@@ -158,7 +183,7 @@ int handle_output_state(unsigned int *processed) {
       *processed = 1;
       break;
     } else {
-      return -1;
+      return -11;  /* diag: NUMBER_OUTPUTS unsupported varint byte */
     }
   } break;
 
@@ -178,7 +203,7 @@ int handle_output_state(unsigned int *processed) {
       discardSize = 3;
     } else {
       // Unrealistically large script
-      return -1;
+      return -12;  /* diag: OUTPUT script_len is 0xFF varint */
     }
     if (context.currentOutputOffset < 8 + discardSize + scriptSize) {
       discardSize = 0;
@@ -191,7 +216,7 @@ int handle_output_state(unsigned int *processed) {
 
     bool displayable;
     if (check_output_displayable(&displayable)) {
-      return -1;
+      return -13;  /* diag: check_output_displayable rejected shape */
     }
 
     if (displayable) {
@@ -203,10 +228,35 @@ int handle_output_state(unsigned int *processed) {
     } else {
       context.remainingOutputs--;
     }
+
+    /* Radiant-only: feed the just-completed output's bytes to the per-output
+     * FSM so they accumulate into hashOutputHashes alongside the existing
+     * hashedOutputs path. No-op for other coins. If the FSM rejects (e.g.,
+     * non-canonical-P2PKH script length), we surface SW_INCORRECT_DATA by
+     * returning -1 here — the caller turns that into a device error.
+     *
+     * CRITICAL: this is inside the OUTPUT case ONLY. Do NOT move this
+     * post-switch — the NUMBER_OUTPUTS case discards the vout-count
+     * varint (1 or 3 bytes) which MUST NOT be fed to the output FSM.
+     *
+     * We feed from either `discardSize` (normal non-displayable path)
+     * OR `context.discardSize` (deferred discard when displayable=true
+     * and UI approval is async). The bytes we want are
+     * context.currentOutput[0 .. bytes_to_feed-1]. */
+    if (COIN_KIND == COIN_KIND_RADIANT) {
+      unsigned int bytes_to_feed = (discardSize != 0) ? discardSize : context.discardSize;
+      for (unsigned int i = 0; i < bytes_to_feed; i++) {
+        unsigned short sw = radiant_output_hash_feed_byte(context.currentOutput[i]);
+        if (sw != 0) {
+          PRINTF("Radiant FSM rejected output byte %u: sw=0x%04x\n", i, sw);
+          return -14;  /* diag: radiant FSM feed_byte rejected */
+        }
+      }
+    }
   } break;
 
   default:
-    return -1;
+    return -15;  /* diag: unknown outputParsingState */
   }
 
   if (discardSize != 0) {
@@ -353,8 +403,20 @@ hash_input_finalize_full_internal(transaction_summary_t *transactionSummary,
 
     unsigned int processed = 1;
     while (processed == 1) {
-      if (handle_output_state(&processed)) {
-        sw = SW_TECHNICAL_PROBLEM_2;
+      int _hos_ret = handle_output_state(&processed);
+      if (_hos_ret) {
+        /* Diagnostic SWs so the host can distinguish which branch
+         * inside handle_output_state rejected. 0x6FB1..0x6FB5 are in
+         * the reserved 0x6FXX technical-problem space and won't
+         * collide with standard Ledger SW codes. */
+        switch (_hos_ret) {
+          case -11: sw = 0x6FB1; break; /* NUMBER_OUTPUTS bad varint */
+          case -12: sw = 0x6FB2; break; /* OUTPUT script_len 0xFF varint */
+          case -13: sw = 0x6FB3; break; /* check_output_displayable rejected */
+          case -14: sw = 0x6FB4; break; /* radiant_output_hash_feed_byte */
+          case -15: sw = 0x6FB5; break; /* unknown parsing state */
+          default:  sw = SW_TECHNICAL_PROBLEM_2; break;
+        }
         goto discardTransaction;
       }
     }
@@ -423,6 +485,19 @@ hash_input_finalize_full_internal(transaction_summary_t *transactionSummary,
         }
       }
       PRINTF("hashOutputs\n%.*H\n", 32, context.segwit.cache.hashedOutputs);
+
+      /* Radiant-only: finalize hashOutputHashes alongside the existing
+       * hashedOutputs finalization. Produces context.segwit.cache.hashedOutputHashes
+       * which gets inserted into the preimage during the signing pass (transaction.c).
+       * Entry-point assertion inside the helper ensures we're in Radiant mode. */
+      if (COIN_KIND == COIN_KIND_RADIANT) {
+        unsigned short r_sw = radiant_output_hash_finalize();
+        if (r_sw != 0) {
+          sw = r_sw;
+          goto discardTransaction;
+        }
+      }
+
       if (cx_hash_no_throw(&context.transactionHashAuthorization.header,
                            CX_LAST, G_io_apdu_buffer, 0, authorizationHash,
                            32)) {

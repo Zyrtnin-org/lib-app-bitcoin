@@ -24,7 +24,11 @@
 #include "nbgl_types.h"
 #endif // HAVE_NBGL
 
-#define MAX_OUTPUT_TO_CHECK 100
+/* Must fit one complete output (8B value + 1B varint + up-to-75B Glyph FT
+ * holder script = 84B) PLUS one in-flight APDU chunk (~50B) while the
+ * previous output is pending UI approval. 100 was too small for 3+ FT-out
+ * transfers — bump to 200 to accommodate the chunk-overlap window. */
+#define MAX_OUTPUT_TO_CHECK 200
 #define MAX_COIN_ID 13
 #define MAX_SHORT_COIN_ID 5
 
@@ -72,6 +76,39 @@ enum output_parsing_state_e {
 };
 typedef enum output_parsing_state_e output_parsing_state_t;
 
+/* Radiant-only per-output byte-streaming substates (see helpers.c).
+ * Tracks where in each output's bytes we are, since an output's
+ * scriptPubKey can span multiple APDU chunks. */
+enum radiant_output_substate_e {
+  RADIANT_OUT_AMOUNT = 0x00,       /* Accumulating the 8-byte nValue LE */
+  RADIANT_OUT_SCRIPT_LEN = 0x01,   /* Accumulating the varint script length */
+  RADIANT_OUT_SCRIPT = 0x02,       /* Streaming scriptPubKey bytes through opcode walker */
+};
+typedef enum radiant_output_substate_e radiant_output_substate_t;
+
+/* Inner opcode-walker substates within RADIANT_OUT_SCRIPT. */
+enum radiant_opcode_substate_e {
+  RADIANT_OP_NEXT = 0x00,           /* Waiting for next opcode byte */
+  RADIANT_OP_SKIP_DATA = 0x01,      /* Skipping push-data payload bytes */
+  RADIANT_OP_PUSHDATA_LEN = 0x02,   /* Reading OP_PUSHDATA1/2/4 length */
+  RADIANT_OP_READ_REF = 0x03,       /* Reading 36-byte push-ref payload */
+};
+typedef enum radiant_opcode_substate_e radiant_opcode_substate_t;
+
+/* Glyph push-ref opcodes */
+#define OP_PUSHINPUTREF             0xD0
+#define OP_REQUIREINPUTREF          0xD1
+#define OP_DISALLOWPUSHINPUTREF     0xD2
+#define OP_DISALLOWPUSHINPUTREFSIBLING 0xD3
+#define OP_PUSHINPUTREFSINGLETON    0xD8
+
+#define OP_PUSHDATA1 0x4C
+#define OP_PUSHDATA2 0x4D
+#define OP_PUSHDATA4 0x4E
+
+#define RADIANT_REF_LEN 36
+#define RADIANT_MAX_PUSH_REFS 8
+
 typedef union multi_hash {
   cx_sha256_t sha256;
   cx_blake2b_t blake2b;
@@ -84,6 +121,11 @@ struct segwit_cache_s {
   unsigned char hashedPrevouts[32];
   unsigned char hashedSequence[32];
   unsigned char hashedOutputs[32];
+  /* Radiant-only: double-SHA256 of concatenated per-output summaries.
+   * Per-output summary = nValue(8) + sha256d(scriptPubKey)(32) + totalRefs(4) + refsHash(32).
+   * Inserted between hashedSequence and hashedOutputs in the preimage.
+   * Unused for other COIN_KINDs. */
+  unsigned char hashedOutputHashes[32];
 };
 
 /**
@@ -196,6 +238,43 @@ struct context_s {
   unsigned char totalOutputAmount[8];
   unsigned char changeOutputFound;
 
+  /* Radiant-only state for hashOutputHashes computation (see helpers.c).
+   * These fields are used only when COIN_KIND == COIN_KIND_RADIANT; other
+   * variants do not touch them. Initialized on hash_input_start and
+   * reset on hash_input_finalize_full_reset. */
+  cx_sha256_t hashOutputHashesCtx;      /* Running sha256 over per-output summaries */
+  cx_sha256_t currentOutputScriptCtx;   /* Per-output inner sha256 over scriptPubKey (first pass of sha256d) */
+  uint32_t currentOutputBytesRemaining; /* Bytes of the current output's scriptPubKey still to stream */
+  uint64_t currentOutputSatoshis;       /* nValue of the current output (latched when its 8 bytes arrive) */
+  unsigned char outputParsingSubstate;  /* Radiant per-output FSM: 0=amount, 1=script_len, 2=script */
+
+  /* Varint accumulation for script length (multi-byte varints) */
+  uint32_t currentOutputScriptLen;      /* Decoded script length from varint */
+  uint8_t varintBuf[4];                 /* Buffer for multi-byte varint bytes */
+  uint8_t varintBufOffset;              /* Bytes read into varintBuf */
+  uint8_t varintBufExpected;            /* Total bytes to read (0=done, 2/4 for FD/FE) */
+
+  /* Opcode walker state within RADIANT_OUT_SCRIPT */
+  uint8_t opcodeSubstate;               /* radiant_opcode_substate_t */
+  uint32_t opSkipRemaining;             /* Bytes remaining to skip (push-data payload) */
+  uint8_t opPushdataLenBuf[4];          /* Buffer for OP_PUSHDATA1/2/4 length */
+  uint8_t opPushdataLenOffset;          /* Bytes read into opPushdataLenBuf */
+  uint8_t opPushdataLenExpected;        /* Bytes to expect (1, 2, or 4) */
+  uint8_t opCurrentRefOpcode;           /* Which push-ref opcode triggered REF read */
+  uint8_t refBuf[RADIANT_REF_LEN];     /* Current ref being accumulated */
+  uint8_t refBufOffset;                 /* Bytes read into refBuf */
+
+  /* Push-ref accumulator (sorted, deduplicated) */
+  uint8_t pushRefs[RADIANT_MAX_PUSH_REFS][RADIANT_REF_LEN];
+  uint8_t numPushRefs;                  /* Count of unique push-refs found */
+
+  /* Disallow-ref accumulator (for consensus-matching conflict detection).
+   * radiantjs rejects any output where a ref appears in both PUSHINPUTREF
+   * and DISALLOWPUSHINPUTREF. We track disallows here and reject at
+   * emit_summary if any overlap with pushRefs. */
+  uint8_t disallowRefs[RADIANT_MAX_PUSH_REFS][RADIANT_REF_LEN];
+  uint8_t numDisallowRefs;              /* Count of unique disallow-refs */
+
   /* Overwinter */
   unsigned char usingOverwinter;
   unsigned char overwinterSignReady;
@@ -246,6 +325,7 @@ typedef enum coin_kind_e {
   COIN_KIND_RESISTANCE,
   COIN_KIND_RAVENCOIN,
   COIN_KIND_HYDRA,
+  COIN_KIND_RADIANT,
   COIN_KIND_UNUSED
 } coin_kind_t;
 

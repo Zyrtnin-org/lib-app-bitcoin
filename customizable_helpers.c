@@ -85,6 +85,35 @@ WEAK unsigned char output_script_is_regular(unsigned char *buffer) {
               sizeof(TRANSACTION_OUTPUT_SCRIPT_POST)) == 0)) {
     return 1;
   }
+  /* Radiant: accept P2PKH-prefixed scripts of any length >= 25 bytes (Glyph
+   * outputs embed push-ref opcodes after the standard P2PKH pattern). Check
+   * OP_DUP OP_HASH160 PUSH20 at buffer[1..3] and OP_EQUALVERIFY OP_CHECKSIG
+   * at buffer[24..25], requiring buffer[0] >= 0x19 so those reads stay within
+   * the declared script bytes. Without this length check a short malformed
+   * script could mis-classify by matching random bytes at buffer[24..25],
+   * enabling a WYSIWYS display-spoofing attack (security audit 2026-04-16). */
+  if (COIN_KIND == COIN_KIND_RADIANT) {
+    if (buffer[0] >= 0x19 &&
+        buffer[1] == 0x76 && buffer[2] == 0xA9 && buffer[3] == 0x14 &&
+        buffer[24] == 0x88 && buffer[25] == 0xAC) {
+      return 1;
+    }
+    /* Radiant Glyph-wrapped P2PKH output (transfer-preserving NFT spend):
+     *   <script_len=0x3F> <0xD8> <ref36> <75 OP_DROP> <76 A9 14 hash20 88 AC>
+     * 0xD8 = OP_PUSHINPUTREFSINGLETON (NFT singleton ref).
+     * FT outputs (0xD0 = OP_PUSHINPUTREF) are deliberately excluded here and
+     * deferred to v0.0.9 where a separate FT-disclosure UI can be added.
+     * Pin the layout strictly (exact 63-byte script, exact opcode positions at
+     * the known offsets) so random bytes can't mis-classify as displayable —
+     * consistent with the input-side Glyph fix (INVESTIGATION.md bug 1). */
+    if (buffer[0] == 0x3F &&
+        buffer[1] == 0xD8 &&
+        buffer[38] == 0x75 &&
+        buffer[39] == 0x76 && buffer[40] == 0xA9 && buffer[41] == 0x14 &&
+        buffer[62] == 0x88 && buffer[63] == 0xAC) {
+      return 1;
+    }
+  }
   if (COIN_KIND == COIN_KIND_HORIZEN) {
     if ((memcmp(buffer, ZEN_OUTPUT_SCRIPT_PRE, sizeof(ZEN_OUTPUT_SCRIPT_PRE)) ==
          0) &&
@@ -94,6 +123,43 @@ WEAK unsigned char output_script_is_regular(unsigned char *buffer) {
     }
   }
 
+  return 0;
+}
+
+/*
+ * Function: output_script_p2pkh_offset
+ * -------------------------------------
+ * Returns the byte offset within `buffer` (where buffer[0] is the script-
+ * length varint) of the 20-byte P2PKH hash for recognised P2PKH-shaped
+ * output scripts. Supports:
+ *   - plain 25-byte P2PKH                                  → offset 4
+ *   - zen-prefixed P2PKH (script_len=0x3F, P2PKH at start) → offset 4
+ *   - Radiant Glyph-wrapped P2PKH (d8|d0 <ref36> 75 ...)  → offset 42
+ * Returns 0 when the buffer is not a P2PKH shape this helper recognises;
+ * callers should fall back to their usual "not displayable" handling.
+ */
+WEAK unsigned char output_script_p2pkh_offset(unsigned char *buffer) {
+  /* Reject scripts too short to safely index buffer[24..25] — a script
+   * claiming P2PKH shape but with buffer[0] < 0x19 (< 25 bytes) would
+   * cause the caller to read 20 bytes of stale buffer data at offset 4. */
+  if (buffer[0] < 0x19) {
+    return 0;
+  }
+  /* Plain P2PKH: OP_DUP OP_HASH160 PUSH20 at start → hash at offset 4. */
+  if (buffer[1] == 0x76 && buffer[2] == 0xA9 && buffer[3] == 0x14) {
+    return 4;
+  }
+  /* Radiant Glyph-wrapped P2PKH (NFT singleton only — 0xD8): inner P2PKH
+   * starts at buffer[39], so the 20-byte hash starts at buffer[42]. Pin
+   * the same strict layout used by output_script_is_regular() above.
+   * FT outputs (0xD0) excluded — deferred to v0.0.9. */
+  if (COIN_KIND == COIN_KIND_RADIANT && buffer[0] == 0x3F &&
+      buffer[1] == 0xD8 &&
+      buffer[38] == 0x75 &&
+      buffer[39] == 0x76 && buffer[40] == 0xA9 && buffer[41] == 0x14 &&
+      buffer[62] == 0x88 && buffer[63] == 0xAC) {
+    return 42;
+  }
   return 0;
 }
 
@@ -168,6 +234,11 @@ WEAK unsigned char output_script_is_native_witness(unsigned char *buffer) {
  *
  */
 WEAK unsigned char output_script_is_op_return(unsigned char *buffer) {
+  /* Reject zero-length scripts: buffer[0] == 0 means there are no script
+   * bytes, so reading buffer[1] would be out of bounds. */
+  if (buffer[0] == 0) {
+    return 0;
+  }
   if (COIN_KIND == COIN_KIND_BITCOIN_CASH) {
     return ((buffer[1] == 0x6A) ||
             ((buffer[1] == 0x00) && (buffer[2] == 0x6A)));
