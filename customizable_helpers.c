@@ -102,13 +102,15 @@ WEAK unsigned char output_script_is_regular(unsigned char *buffer) {
       return 1;
     }
     /* Radiant Glyph-wrapped P2PKH output (transfer-preserving NFT spend):
-     *   <script_len=0x3F> <d8|d0> <ref36> <75 OP_DROP> <76 A9 14 hash20 88 AC>
-     * 0xd8 = OP_PUSHINPUTREFSINGLETON (NFT); 0xd0 = OP_PUSHINPUTREF (FT).
+     *   <script_len=0x3F> <0xD8> <ref36> <75 OP_DROP> <76 A9 14 hash20 88 AC>
+     * 0xD8 = OP_PUSHINPUTREFSINGLETON (NFT singleton ref).
+     * FT outputs (0xD0 = OP_PUSHINPUTREF) are deliberately excluded here and
+     * deferred to v0.0.9 where a separate FT-disclosure UI can be added.
      * Pin the layout strictly (exact 63-byte script, exact opcode positions at
      * the known offsets) so random bytes can't mis-classify as displayable —
      * consistent with the input-side Glyph fix (INVESTIGATION.md bug 1). */
     if (buffer[0] == 0x3F &&
-        (buffer[1] == 0xD8 || buffer[1] == 0xD0) &&
+        buffer[1] == 0xD8 &&
         buffer[38] == 0x75 &&
         buffer[39] == 0x76 && buffer[40] == 0xA9 && buffer[41] == 0x14 &&
         buffer[62] == 0x88 && buffer[63] == 0xAC) {
@@ -144,11 +146,12 @@ WEAK unsigned char output_script_p2pkh_offset(unsigned char *buffer) {
   if (buffer[1] == 0x76 && buffer[2] == 0xA9 && buffer[3] == 0x14) {
     return 4;
   }
-  /* Radiant Glyph-wrapped P2PKH: inner P2PKH starts at buffer[39], so the
-   * 20-byte hash starts at buffer[42]. Pin the same strict layout used by
-   * output_script_is_regular() above. */
+  /* Radiant Glyph-wrapped P2PKH (NFT singleton only — 0xD8): inner P2PKH
+   * starts at buffer[39], so the 20-byte hash starts at buffer[42]. Pin
+   * the same strict layout used by output_script_is_regular() above.
+   * FT outputs (0xD0) excluded — deferred to v0.0.9. */
   if (COIN_KIND == COIN_KIND_RADIANT && buffer[0] == 0x3F &&
-      (buffer[1] == 0xD8 || buffer[1] == 0xD0) &&
+      buffer[1] == 0xD8 &&
       buffer[38] == 0x75 &&
       buffer[39] == 0x76 && buffer[40] == 0xA9 && buffer[41] == 0x14 &&
       buffer[62] == 0x88 && buffer[63] == 0xAC) {
